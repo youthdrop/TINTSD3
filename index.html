@@ -29,23 +29,6 @@
   <script src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js"></script>
 
   <script>
-    /* -------- Compact status box (only last line shown) -------- */
-    const statusBox = (msg, isErr=false) => {
-      let el = document.getElementById('load-status');
-      if (!el) {
-        el = document.createElement('div');
-        el.id = 'load-status';
-        Object.assign(el.style, {
-          position:'absolute', top:'10px', right:'10px', background:'#fff',
-          border:'1px solid #999', padding:'8px 10px', borderRadius:'6px',
-          font:'13px system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial',
-          maxWidth:'320px', boxShadow:'0 2px 8px rgba(0,0,0,.08)', zIndex:9999
-        });
-        document.body.appendChild(el);
-      }
-      el.innerHTML = `<div style="color:${isErr?'#b00020':'#111'}">${msg}</div>`;
-    };
-
     /* -------- Colors & normalizers -------- */
     const DIV_COLORS = {
       "Central": "#1976d2","Mid-City": "#2e7d32","Southeastern": "#d32f2f",
@@ -94,50 +77,64 @@
     }).addTo(map);
 
     /* -------- Divisions shading (polygonize if lines) -------- */
-    // Put polygons under markers
     map.createPane('divisions-pane');
     map.getPane('divisions-pane').style.zIndex = 350;
     map.getPane('divisions-pane').style.pointerEvents = 'none';
 
-    const DIVISIONS_GEOJSON_URL = 'pd_divisions_datasd.geojson';
-    const divProp = p => p?.DIVISION ?? p?.Division ?? p?.division ?? p?.Div_Name ?? p?.DIV_NAME ?? p?.DivName ?? p?.name ?? '';
+    // UPDATED: include div_name and variants
+    const divProp = p =>
+      p?.DIVISION ?? p?.Division ?? p?.division ??
+      p?.Div_Name ?? p?.DIV_NAME ?? p?.DivName ??
+      p?.div_name ?? p?.divName ?? p?.DIV ?? p?.div ??
+      p?.name ?? '';
+
+    // UPDATED: guarantee fill for polygons
     const styleDivision = f => {
       const d = normDivision(divProp(f.properties||{}));
       const c = DIV_COLORS[d] || DIV_COLORS.Unknown;
-      return { pane:'divisions-pane', color:c, weight:2, fillColor:c, fillOpacity:0.18 };
+      return { pane:'divisions-pane', color:c, weight:1, fill:true, fillColor:c, fillOpacity:0.35 };
     };
-    const anyLineFeatures = fc => (fc?.features||[]).some(f => /LineString/i.test(f?.geometry?.type||''));
-    const shadeGeoJSON = fc => L.geoJSON(fc, {
-      style: styleDivision,
-      onEachFeature:(f,layer)=>{
-        const d = normDivision(divProp(f.properties||{}));
-        layer.bindTooltip(d,{sticky:true});
-      }
-    }).addTo(map);
 
-    fetch(DIVISIONS_GEOJSON_URL + `?v=${Date.now()}`)
-      .then(r => { if(!r.ok) throw new Error(`${r.status} ${DIVISIONS_GEOJSON_URL}`); return r.json(); })
+    const anyType = (fc, rx) => (fc?.features||[]).some(f => rx.test(f?.geometry?.type||''));
+
+    function drawOutlines(geo){
+      L.geoJSON(geo, { pane:'divisions-pane', style:f=>{
+        const d = normDivision(divProp(f.properties||{}));
+        const c = DIV_COLORS[d] || DIV_COLORS.Unknown;
+        return { color:c, weight:2, fillOpacity:0 };
+      }}).addTo(map);
+    }
+
+    function shadePolygons(geo){
+      L.geoJSON(geo, {
+        style: styleDivision,
+        onEachFeature:(f,layer)=>{
+          const d = normDivision(divProp(f.properties||{}));
+          layer.bindTooltip(d,{sticky:true});
+        }
+      }).addTo(map);
+    }
+
+    fetch('pd_divisions_datasd.geojson?v='+Date.now())
+      .then(r => r.ok ? r.json() : null)
       .then(geo => {
-        if (anyLineFeatures(geo) && window.turf && turf.polygonize) {
+        if (!geo) return;
+        const hasPolys = anyType(geo, /Polygon/i);
+        const hasLines = anyType(geo, /LineString/i);
+        if (hasPolys) {
+          shadePolygons(geo);
+        } else if (hasLines && window.turf && turf.polygonize) {
           try {
             const poly = turf.polygonize(geo);
-            shadeGeoJSON(poly);
-            statusBox('Divisions loaded ✓ (polygonized)');
-          } catch (e) {
-            console.warn('Polygonize failed; drawing outlines only:', e);
-            L.geoJSON(geo, { pane:'divisions-pane', style:f=>{
-              const d = normDivision(divProp(f.properties||{}));
-              const c = DIV_COLORS[d] || DIV_COLORS.Unknown;
-              return { color:c, weight:3, fillOpacity:0 };
-            }}).addTo(map);
-            statusBox('Divisions drawn as outlines (could not polygonize).');
+            if (!poly?.features?.length) drawOutlines(geo);
+            else shadePolygons(poly);
+          } catch {
+            drawOutlines(geo);
           }
         } else {
-          shadeGeoJSON(geo);
-          statusBox('Divisions loaded ✓');
+          drawOutlines(geo);
         }
-      })
-      .catch(e => statusBox(`Division polygons failed: ${e.message}`, true));
+      });
 
     /* -------- Pins / clusters from 24 JSON parts -------- */
     const cluster = L.markerClusterGroup({ disableClusteringAtZoom: 15 }).addTo(map);
@@ -167,40 +164,26 @@
       added++;
     }
 
-    // Parse JSON with safe normalizations
-    function safeParseJSON(raw, url) {
-      if (/^\s*<(!doctype|html|\?xml)/i.test(raw)) {
-        throw new Error(`"${url}" is HTML (likely 404). Check path/case.`);
-      }
+    function safeParseJSON(raw) {
+      if (/^\s*<(!doctype|html|\?xml)/i.test(raw)) return null; // 404 HTML
       const cleaned = raw
-        .replace(/\bNaN\b/gi, 'null')   // JSON doesn’t allow NaN
-        .replace(/,\s*([}\]])/g, '$1'); // trailing commas
-      try {
-        return JSON.parse(cleaned);
-      } catch (e) {
-        console.error(`Failed to parse ${url}. First 200 chars:`, raw.slice(0,200));
-        throw e;
-      }
+        .replace(/\bNaN\b/gi, 'null')
+        .replace(/,\s*([}\]])/g, '$1');
+      try { return JSON.parse(cleaned); } catch { return null; }
     }
 
     (async function loadParts(){
-      let loaded=0;
       for (const url of PARTS) {
         try {
-          const res = await fetch(url + `?v=${Date.now()}`, { cache: 'no-store' });
-          if (!res.ok) { statusBox(`Missing: ${url} (${res.status})`, true); continue; }
+          const res = await fetch(url + '?v='+Date.now(), { cache: 'no-store' });
+          if (!res.ok) continue;
           const raw = await res.text();
-          const data = safeParseJSON(raw, url);
-          if (!Array.isArray(data)) { statusBox(`Error: ${url} is not an array`, true); continue; }
+          const data = safeParseJSON(raw);
+          if (!Array.isArray(data)) continue;
           data.forEach(addStop);
-          loaded++;
-          statusBox(`Loaded: ${url} — pins: ${added.toLocaleString()}`);
-        } catch (e) {
-          statusBox(`Error loading ${url}: ${e.message}`, true);
-        }
+        } catch { /* silent */ }
       }
       if (added > 0) map.fitBounds(bounds.pad(0.05));
-      if (loaded === 0) statusBox('No parts loaded — check folder/name pattern.', true);
     })();
 
     /* -------- Legends (Race pins + Division polygons) -------- */
