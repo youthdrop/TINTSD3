@@ -119,9 +119,10 @@
     const PARTS = Array.from({length:24},(_,i)=>`parts/part_${String(i+1).padStart(2,'0')}.json`);
 
     let added=0, bounds=L.latLngBounds();
+
     function addStop(rec){
       const lat = parseFloat(rec.lat), lon = parseFloat(rec.lon);
-      if(isNaN(lat)||isNaN(lon)) return;
+      if (isNaN(lat) || isNaN(lon)) return;
       const div = normDivision(rec.Division);
       const race = normRace(rec.Race);
 
@@ -142,22 +143,48 @@
       added++;
     }
 
+    // Try to parse JSON with a few safe normalizations
+    function safeParseJSON(raw, url) {
+      // If the file is actually HTML (404 page), bail with helpful console info
+      if (/^\s*<(!doctype|html|\?xml)/i.test(raw)) {
+        throw new Error(`"${url}" looks like HTML, not JSON (got an HTML page). Check the path/case.`);
+      }
+      // Normalize common non-JSON tokens
+      let cleaned = raw
+        .replace(/\bNaN\b/gi, 'null')        // JSON doesn't allow NaN
+        .replace(/,\s*([}\]])/g, '$1');      // trailing commas
+      try {
+        return JSON.parse(cleaned);
+      } catch (e) {
+        console.error(`Failed to parse ${url}. First 200 chars:`, raw.slice(0,200));
+        throw e;
+      }
+    }
+
     (async function loadParts(){
       let loaded=0;
-      for(const url of PARTS){
-        try{
-          const res = await fetch(url + `?v=${Date.now()}`); // cache-bust
-          if(!res.ok){ statusBox(`Missing: ${url} (${res.status})`, true); continue; }
-          const data = await res.json();  // array
+      for (const url of PARTS) {
+        try {
+          const res = await fetch(url + `?v=${Date.now()}`, { cache: 'no-store' });
+          if (!res.ok) { statusBox(`Missing: ${url} (${res.status})`, true); continue; }
+          const raw = await res.text();
+          const data = safeParseJSON(raw, url);
+
+          if (!Array.isArray(data)) {
+            console.warn(`Part is not an array: ${url}`, data);
+            statusBox(`Error: ${url} is not an array`, true);
+            continue;
+          }
+
           data.forEach(addStop);
           loaded++;
           statusBox(`Loaded ${url} — total pins on map: ${added.toLocaleString()}`);
-        }catch(e){
+        } catch (e) {
           statusBox(`Error loading ${url}: ${e.message}`, true);
         }
       }
-      if (added>0) map.fitBounds(bounds.pad(0.05));
-      if (loaded===0) statusBox('No parts loaded — check folder/name pattern.', true);
+      if (added > 0) map.fitBounds(bounds.pad(0.05));
+      if (loaded === 0) statusBox('No parts loaded — check folder/name pattern.', true);
     })();
 
     /* -------- Legends (Race pins + Division polygons) -------- */
