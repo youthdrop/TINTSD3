@@ -8,7 +8,11 @@
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
   <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
-  <style>#map{height:100vh;margin:0}</style>
+  <style>
+    /* Make the map truly full screen, overriding site CSS */
+    html, body { height:100%; margin:0; padding:0; }
+    #map{ height:100vh; margin:0; }
+  </style>
 </head>
 <body>
   <div id="map"></div>
@@ -16,7 +20,23 @@
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
   <script>
-    // --- Division colors (used for polygon shading) ---
+    /* -------- Tiny status box (helps find 404s quickly) -------- */
+    const statusBox = (msg, isErr=false) => {
+      let el = document.getElementById('load-status');
+      if (!el) {
+        el = document.createElement('div');
+        el.id = 'load-status';
+        el.style.position='absolute'; el.style.top='10px'; el.style.right='10px';
+        el.style.background='#fff'; el.style.border='1px solid #999';
+        el.style.padding='8px 10px'; el.style.borderRadius='6px';
+        el.style.font='13px system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial';
+        el.style.maxWidth='320px'; el.style.boxShadow='0 2px 8px rgba(0,0,0,.08)';
+        document.body.appendChild(el);
+      }
+      el.innerHTML += `<div style="color:${isErr?'#b00020':'#111'}">${msg}</div>`;
+    };
+
+    /* -------- Division colors (for polygon shading) -------- */
     const DIV_COLORS = {
       "Central": "#1976d2","Mid-City": "#2e7d32","Southeastern": "#d32f2f",
       "Eastern": "#ef6c00","Southern": "#8e0000","Northern": "#00838f",
@@ -38,7 +58,7 @@
       return "Unknown";
     }
 
-    // --- Pin colors by Race (normalize variants we saw in your data) ---
+    /* -------- Pin colors by Race (normalize variants) -------- */
     const RACE_COLORS = {
       "White":"#ffffff","Black":"#111111","Hispanic/Latino":"#ff8800",
       "Asian":"#0066ff","Pacific Islander":"#00c4a7",
@@ -58,41 +78,45 @@
       return "Unknown";
     }
 
-    // --- Map base ---
+    /* -------- Map base -------- */
     const map = L.map('map').setView([32.75, -117.12], 11);
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
       maxZoom:19, attribution:'© OpenStreetMap'
     }).addTo(map);
 
-    // --- Shade division polygons ---
-    const DIVISIONS_GEOJSON_URL = 'pd_divisions_datasd.geojson'; // adjust if you moved it
-    const getDivProp = p => p?.DIVISION ?? p?.Division ?? p?.division ?? p?.name ?? '';
-    fetch(DIVISIONS_GEOJSON_URL).then(r=>r.json()).then(geo=>{
-      L.geoJSON(geo,{
-        style: f=>{
-          const d = normDivision(getDivProp(f.properties||{}));
-          const c = DIV_COLORS[d]||DIV_COLORS.Unknown;
-          return {color:c,weight:2,fillColor:c,fillOpacity:0.15};
-        },
-        onEachFeature:(f,layer)=>{
-          const d = normDivision(getDivProp(f.properties||{}));
-          layer.bindTooltip(d,{sticky:true});
-        }
-      }).addTo(map);
-    }).catch(e=>console.warn('Polygons load error:',e));
+    /* -------- Shade division polygons -------- */
+    const DIVISIONS_GEOJSON_URL = 'pd_divisions_datasd.geojson';
+    const getDivProp = p => p?.DIVISION ?? p?.Division ?? p?.division ?? p?.Div_Name ?? p?.DIV_NAME ?? p?.DivName ?? p?.name ?? '';
+    fetch(DIVISIONS_GEOJSON_URL + `?v=${Date.now()}`)
+      .then(r => { if(!r.ok) throw new Error(`${r.status} ${DIVISIONS_GEOJSON_URL}`); return r.json(); })
+      .then(geo => {
+        L.geoJSON(geo,{
+          style: f=>{
+            const d = normDivision(getDivProp(f.properties||{}));
+            const c = DIV_COLORS[d]||DIV_COLORS.Unknown;
+            return {color:c,weight:2,fillColor:c,fillOpacity:0.15};
+          },
+          onEachFeature:(f,layer)=>{
+            const d = normDivision(getDivProp(f.properties||{}));
+            layer.bindTooltip(d,{sticky:true});
+          }
+        }).addTo(map);
+        statusBox('Divisions loaded ✓');
+      })
+      .catch(e=>statusBox(`Division polygons failed: ${e.message}`, true));
 
-    // --- Cluster for all stops (from 24 JSON files) ---
+    /* -------- Cluster for all stops (24 JSON files) -------- */
     const cluster = L.markerClusterGroup({ disableClusteringAtZoom: 15 }).addTo(map);
 
-    // If your files live in /parts and are named part_01.json .. part_24.json:
+    // Your files are in /parts and named part_01.json .. part_24.json
     const PARTS = Array.from({length:24},(_,i)=>`parts/part_${String(i+1).padStart(2,'0')}.json`);
-    // If they’re in the root, change to: const PARTS = Array.from({length:24},(_,i)=>`part_${String(i+1).padStart(2,'0')}.json`);
 
     function addStop(rec){
       const div = normDivision(rec.Division);
       const race = normRace(rec.Race);
       const lat = parseFloat(rec.lat), lon = parseFloat(rec.lon);
       if(isNaN(lat)||isNaN(lon)) return;
+
       const marker = L.circleMarker([lat,lon],{
         radius:6, color:"#333",
         fillColor: RACE_COLORS[race]||RACE_COLORS.Unknown,
@@ -109,14 +133,20 @@
     }
 
     (async function loadParts(){
+      let loaded=0, added=0;
       for(const url of PARTS){
         try{
-          const res = await fetch(url);
-          if(!res.ok){ console.warn('Missing',url); continue; }
+          const res = await fetch(url + `?v=${Date.now()}`); // cache-bust
+          if(!res.ok){ statusBox(`Missing: ${url} (${res.status})`, true); continue; }
           const data = await res.json();  // array
           data.forEach(addStop);
-        }catch(e){ console.warn('Error loading',url,e); }
+          loaded++; added += data.length;
+          statusBox(`Loaded ${url} — total pins on map: ${added.toLocaleString()}`);
+        }catch(e){
+          statusBox(`Error loading ${url}: ${e.message}`, true);
+        }
       }
+      if (loaded===0) statusBox('No parts loaded — check folder/name pattern.', true);
     })();
   </script>
 </body>
