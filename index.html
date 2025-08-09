@@ -23,10 +23,13 @@
 <body>
   <div id="map"></div>
 
+  <!-- libs -->
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js"></script>
+
   <script>
-    /* -------- Tiny status box (helps find 404s quickly) -------- */
+    /* -------- Compact status box (only last line shown) -------- */
     const statusBox = (msg, isErr=false) => {
       let el = document.getElementById('load-status');
       if (!el) {
@@ -40,10 +43,10 @@
         });
         document.body.appendChild(el);
       }
-      el.innerHTML += `<div style="color:${isErr?'#b00020':'#111'}">${msg}</div>`;
+      el.innerHTML = `<div style="color:${isErr?'#b00020':'#111'}">${msg}</div>`;
     };
 
-    /* -------- Division colors (for polygon shading) -------- */
+    /* -------- Colors & normalizers -------- */
     const DIV_COLORS = {
       "Central": "#1976d2","Mid-City": "#2e7d32","Southeastern": "#d32f2f",
       "Eastern": "#ef6c00","Southern": "#8e0000","Northern": "#00838f",
@@ -65,7 +68,6 @@
       return "Unknown";
     }
 
-    /* -------- Pin colors by Race (normalize variants) -------- */
     const RACE_COLORS = {
       "White":"#ffffff","Black":"#111111","Hispanic/Latino":"#ff8800",
       "Asian":"#0066ff","Pacific Islander":"#00c4a7",
@@ -91,31 +93,54 @@
       maxZoom:19, attribution:'© OpenStreetMap'
     }).addTo(map);
 
-    /* -------- Shade division polygons -------- */
+    /* -------- Divisions shading (polygonize if lines) -------- */
+    // Put polygons under markers
+    map.createPane('divisions-pane');
+    map.getPane('divisions-pane').style.zIndex = 350;
+    map.getPane('divisions-pane').style.pointerEvents = 'none';
+
     const DIVISIONS_GEOJSON_URL = 'pd_divisions_datasd.geojson';
-    const getDivProp = p => p?.DIVISION ?? p?.Division ?? p?.division ?? p?.Div_Name ?? p?.DIV_NAME ?? p?.DivName ?? p?.name ?? '';
+    const divProp = p => p?.DIVISION ?? p?.Division ?? p?.division ?? p?.Div_Name ?? p?.DIV_NAME ?? p?.DivName ?? p?.name ?? '';
+    const styleDivision = f => {
+      const d = normDivision(divProp(f.properties||{}));
+      const c = DIV_COLORS[d] || DIV_COLORS.Unknown;
+      return { pane:'divisions-pane', color:c, weight:2, fillColor:c, fillOpacity:0.18 };
+    };
+    const anyLineFeatures = fc => (fc?.features||[]).some(f => /LineString/i.test(f?.geometry?.type||''));
+    const shadeGeoJSON = fc => L.geoJSON(fc, {
+      style: styleDivision,
+      onEachFeature:(f,layer)=>{
+        const d = normDivision(divProp(f.properties||{}));
+        layer.bindTooltip(d,{sticky:true});
+      }
+    }).addTo(map);
+
     fetch(DIVISIONS_GEOJSON_URL + `?v=${Date.now()}`)
       .then(r => { if(!r.ok) throw new Error(`${r.status} ${DIVISIONS_GEOJSON_URL}`); return r.json(); })
       .then(geo => {
-        L.geoJSON(geo,{
-          style: f=>{
-            const d = normDivision(getDivProp(f.properties||{}));
-            const c = DIV_COLORS[d]||DIV_COLORS.Unknown;
-            return {color:c,weight:2,fillColor:c,fillOpacity:0.15};
-          },
-          onEachFeature:(f,layer)=>{
-            const d = normDivision(getDivProp(f.properties||{}));
-            layer.bindTooltip(d,{sticky:true});
+        if (anyLineFeatures(geo) && window.turf && turf.polygonize) {
+          try {
+            const poly = turf.polygonize(geo);
+            shadeGeoJSON(poly);
+            statusBox('Divisions loaded ✓ (polygonized)');
+          } catch (e) {
+            console.warn('Polygonize failed; drawing outlines only:', e);
+            L.geoJSON(geo, { pane:'divisions-pane', style:f=>{
+              const d = normDivision(divProp(f.properties||{}));
+              const c = DIV_COLORS[d] || DIV_COLORS.Unknown;
+              return { color:c, weight:3, fillOpacity:0 };
+            }}).addTo(map);
+            statusBox('Divisions drawn as outlines (could not polygonize).');
           }
-        }).addTo(map);
-        statusBox('Divisions loaded ✓');
+        } else {
+          shadeGeoJSON(geo);
+          statusBox('Divisions loaded ✓');
+        }
       })
-      .catch(e=>statusBox(`Division polygons failed: ${e.message}`, true));
+      .catch(e => statusBox(`Division polygons failed: ${e.message}`, true));
 
-    /* -------- Cluster for all stops (24 JSON files) -------- */
+    /* -------- Pins / clusters from 24 JSON parts -------- */
     const cluster = L.markerClusterGroup({ disableClusteringAtZoom: 15 }).addTo(map);
-
-    // Files live in /parts and are named part_01.json .. part_24.json
     const PARTS = Array.from({length:24},(_,i)=>`parts/part_${String(i+1).padStart(2,'0')}.json`);
 
     let added=0, bounds=L.latLngBounds();
@@ -125,7 +150,6 @@
       if (isNaN(lat) || isNaN(lon)) return;
       const div = normDivision(rec.Division);
       const race = normRace(rec.Race);
-
       const marker = L.circleMarker([lat,lon],{
         radius:6, color:"#333",
         fillColor: RACE_COLORS[race]||RACE_COLORS.Unknown,
@@ -143,16 +167,14 @@
       added++;
     }
 
-    // Try to parse JSON with a few safe normalizations
+    // Parse JSON with safe normalizations
     function safeParseJSON(raw, url) {
-      // If the file is actually HTML (404 page), bail with helpful console info
       if (/^\s*<(!doctype|html|\?xml)/i.test(raw)) {
-        throw new Error(`"${url}" looks like HTML, not JSON (got an HTML page). Check the path/case.`);
+        throw new Error(`"${url}" is HTML (likely 404). Check path/case.`);
       }
-      // Normalize common non-JSON tokens
-      let cleaned = raw
-        .replace(/\bNaN\b/gi, 'null')        // JSON doesn't allow NaN
-        .replace(/,\s*([}\]])/g, '$1');      // trailing commas
+      const cleaned = raw
+        .replace(/\bNaN\b/gi, 'null')   // JSON doesn’t allow NaN
+        .replace(/,\s*([}\]])/g, '$1'); // trailing commas
       try {
         return JSON.parse(cleaned);
       } catch (e) {
@@ -169,16 +191,10 @@
           if (!res.ok) { statusBox(`Missing: ${url} (${res.status})`, true); continue; }
           const raw = await res.text();
           const data = safeParseJSON(raw, url);
-
-          if (!Array.isArray(data)) {
-            console.warn(`Part is not an array: ${url}`, data);
-            statusBox(`Error: ${url} is not an array`, true);
-            continue;
-          }
-
+          if (!Array.isArray(data)) { statusBox(`Error: ${url} is not an array`, true); continue; }
           data.forEach(addStop);
           loaded++;
-          statusBox(`Loaded ${url} — total pins on map: ${added.toLocaleString()}`);
+          statusBox(`Loaded: ${url} — pins: ${added.toLocaleString()}`);
         } catch (e) {
           statusBox(`Error loading ${url}: ${e.message}`, true);
         }
