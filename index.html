@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>TINTSD — All Stops (Divisions Shaded + Pins Colored + Race Layers)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
+  <style>
+    html, body, #map { height: 100%; margin: 0; }
+    .legend { background:#fff; padding:8px 10px; border:1px solid #999; border-radius:6px; line-height:1.3; }
+    .legend .row { display:flex; gap:6px; align-items:center; margin:2px 0; }
+    .swatch { width:12px; height:12px; border-radius:50%; display:inline-block; border:1px solid #666; }
+    .topbar {
+      position:absolute; z-index:9999; left:10px; top:10px;
+      background:#fff; border:1px solid #999; padding:8px 10px; border-radius:6px;
+      font: 14px/1.3 system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+      box-shadow: 0 2px 8px rgba(0,0,0,.08);
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div class="topbar">
+    <b>TINTSD</b> — loading divisions + all parts + race layers…
+    <span id="status"></span>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+  <script>
+    // -------- Division colors (consistent everywhere) --------
+    const COLORS = {
+      "Central": "#1976d2",
+      "Mid-City": "#2e7d32",
+      "Southeastern": "#d32f2f",
+      "Eastern": "#ef6c00",
+      "Southern": "#8e0000",
+      "Northern": "#00838f",
+      "Western": "#6a1b9a",
+      "Northeastern": "#0d47a1",
+      "Northwestern": "#43a047",
+      "Unknown": "#616161"
+    };
+
+    function normDivision(name) {
+      if (!name) return 'Unknown';
+      const n = String(name).trim().toLowerCase().replace(/\s*division\s*$/,'');
+      if (/^mid[-\s]?city$/.test(n)) return 'Mid-City';
+      if (n === 'central') return 'Central';
+      if (n === 'eastern') return 'Eastern';
+      if (n === 'northern') return 'Northern';
+      if (n === 'northwestern') return 'Northwestern';
+      if (n === 'northeastern') return 'Northeastern';
+      if (n === 'southeastern') return 'Southeastern';
+      if (n === 'southern') return 'Southern';
+      if (n === 'western') return 'Western';
+      return 'Unknown';
+    }
+
+    // -------- Map + base layers --------
+    const map = L.map('map').setView([32.75, -117.12], 11);
+    const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19, attribution: '© OpenStreetMap'
+    }).addTo(map);
+
+    // Cluster for "All Stops" (from parts)
+    const allStopsCluster = L.markerClusterGroup({ disableClusteringAtZoom: 15 }).addTo(map);
+
+    // Race-specific overlay groups (one per race)
+    const raceLayers = {
+      "Asian": L.layerGroup(),
+      "Black": L.layerGroup(),
+      "Hispanic/Latino": L.layerGroup(),
+      "Middle Eastern/South Asian": L.layerGroup(),
+      "Native American": L.layerGroup(),
+      "Pacific Islander": L.layerGroup(),
+      "White": L.layerGroup()
+      // "Unknown" is omitted by default (tiny count); add if you want it visible
+    };
+
+    // Legend for division colors
+    const legend = L.control({position: 'bottomleft'});
+    legend.onAdd = function () {
+      const div = L.DomUtil.create('div', 'legend');
+      div.innerHTML = '<b>SDPD Divisions</b>';
+      ["Central","Mid-City","Southeastern","Eastern","Southern","Northern","Western","Northeastern","Northwestern"]
+        .forEach(k => div.innerHTML += `<div class="row"><span class="swatch" style="background:${COLORS[k]}"></span> ${k}</div>`);
+      return div;
+    };
+    legend.addTo(map);
+
+    // -------- Division polygons (shaded areas) --------
+    const DIVISIONS_GEOJSON_URL = 'pd_divisions_datasd.geojson'; // adjust path if different
+    function getDivisionProp(props) {
+      return props?.DIVISION ?? props?.Division ?? props?.division ?? props?.DivName ?? props?.name ?? '';
+    }
+    function divisionStyle(feature) {
+      const div = normDivision(getDivisionProp(feature.properties));
+      const color = COLORS[div] || COLORS.Unknown;
+      return { color, weight: 2, fillColor: color, fillOpacity: 0.15 };
+    }
+    function onEachDivision(feature, layer) {
+      const div = normDivision(getDivisionProp(feature.properties));
+      layer.bindTooltip(div, { sticky: true });
+    }
+    fetch(DIVISIONS_GEOJSON_URL)
+      .then(r => r.json())
+      .then(geo => L.geoJSON(geo, { style: divisionStyle, onEachFeature: onEachDivision }).addTo(map))
+      .catch(err => console.warn('Division polygons failed to load:', err));
+
+    // -------- Load ALL STOP parts into the cluster --------
+    const PARTS = Array.from({length: 34}, (_, i) => `parts/part_${String(i+1).padStart(2,'0')}.json`);
+    const statusEl = document.getElementById('status');
+    let loaded = 0, total = PARTS.length, added = 0;
+
+    function addAllStop(rec) {
+      const div = normDivision(rec.Division);
+      const color = COLORS[div] || COLORS.Unknown;
+      const lat = parseFloat(rec.lat), lon = parseFloat(rec.lon);
+      if (isNaN(lat) || isNaN(lon)) return;
+
+      const html = `
+        <div style="font-size:13px;line-height:1.4">
+          <b>Division:</b> ${div}<br/>
+          <b>Beat:</b> ${rec.beatName ?? ""}<br/>
+          ${rec.street ? `<b>Street:</b> ${rec.street}<br/>` : ""}
+          ${rec.Race ? `<b>Race:</b> ${rec.Race}` : ""}
+        </div>`;
+
+      const marker = L.circleMarker([lat, lon], {
+        radius: 6, color, fillColor: color, fillOpacity: 0.9, weight: 1
+      }).bindPopup(html);
+      allStopsCluster.addLayer(marker);
+      added++;
+    }
+
+    (async function loadAllParts() {
+      for (const url of PARTS) {
+        try {
+          const res = await fetch(url);
+          if (res.ok) {
+            const data = await res.json();
+            data.forEach(addAllStop);
+          } else {
+            console.warn('Missing:', url);
+          }
+        } catch (e) {
+          console.warn('Error loading:', url, e);
+        } finally {
+          loaded++;
+          statusEl.textContent = ` (${loaded}/${total} parts, ${added.toLocaleString()} pins)`;
+        }
+      }
+      statusEl.textContent = ` — done (${added.toLocaleString()} pins)`;
+    })();
+
+    // -------- Load Race Layers (each race as its own JSON) --------
+    const RACE_FILES = {
+      "Asian": "parts_race/race_asian.json",
+      "Black": "parts_race/race_black.json",
+      "Hispanic/Latino": "parts_race/race_hispanic_latino.json",
+      "Middle Eastern/South Asian": "parts_race/race_middle_eastern_south_asian.json",
+      "Native American": "parts_race/race_native_american.json",
+      "Pacific Islander": "parts_race/race_pacific_islander.json",
+      "White": "parts_race/race_white.json"
+      // "Unknown": "parts_race/race_unknown.json"
+    };
+
+    function addRaceRecord(rec, layerGroup) {
+      const div = normDivision(rec.Division);
+      const color = COLORS[div] || COLORS.Unknown;
+      const lat = parseFloat(rec.lat), lon = parseFloat(rec.lon);
+      if (isNaN(lat) || isNaN(lon)) return;
+
+      const html = `
+        <div style="font-size:13px;line-height:1.4">
+          <b>Division:</b> ${div}<br/>
+          <b>Beat:</b> ${rec.beatName ?? ""}<br/>
+          ${rec.street ? `<b>Street:</b> ${rec.street}<br/>` : ""}
+          ${rec.Race ? `<b>Race:</b> ${rec.Race}` : ""}
+        </div>`;
+
+      const marker = L.circleMarker([lat, lon], {
+        radius: 6, color, fillColor: color, fillOpacity: 0.9, weight: 1
+      }).bindPopup(html);
+      layerGroup.addLayer(marker);
+    }
+
+    // Load each race JSON
+    for (const [race, url] of Object.entries(RACE_FILES)) {
+      fetch(url)
+        .then(r => r.json())
+        .then(arr => arr.forEach(rec => addRaceRecord(rec, raceLayers[race])))
+        .catch(err => console.warn('Race layer failed:', race, url, err));
+    }
+
+    // -------- Layer control --------
+    const baseLayers = { "OpenStreetMap": osm };
+    const overlays = {
+      "All Stops (clustered)": allStopsCluster,
+      "Asian": raceLayers["Asian"],
+      "Black": raceLayers["Black"],
+      "Hispanic/Latino": raceLayers["Hispanic/Latino"],
+      "Middle Eastern/South Asian": raceLayers["Middle Eastern/South Asian"],
+      "Native American": raceLayers["Native American"],
+      "Pacific Islander": raceLayers["Pacific Islander"],
+      "White": raceLayers["White"]
+      // ,"Unknown": raceLayers["Unknown"]
+    };
+    L.control.layers(baseLayers, overlays, { collapsed: false }).addTo(map);
+  </script>
+</body>
+</html>
